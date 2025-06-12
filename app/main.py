@@ -49,10 +49,30 @@ async def scrape(body: Req):
         browser = await p.chromium.launch(args=["--no-sandbox"])
         page = await browser.new_page()
         try:
-            await page.goto(url, timeout=30000)
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(2000)  # 给前端 JS 2s 渲染
-            html = await page.content()
+    # 1) 先到 DOMReady，不等所有资源
+    await page.goto(url, timeout=45000, wait_until="domcontentloaded")
+
+    # 2) 等网络静默 1.5 s；若持续有请求也不再无限等
+    try:
+        await page.wait_for_load_state("networkidle", timeout=1500)
+    except TimeoutError:
+        pass                                   # 忽略二级超时
+
+    # 3) 再给 JS 1.5 s 渲染
+    await page.wait_for_timeout(1500)
+    html = await page.content()
+
+except TimeoutError:
+    # ---------- 兜底：导航 45 s 仍超时 → 直接走 jina.ai 纯文本 ----------
+    proxy_url = f"https://r.jina.ai/http://{url}"
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(proxy_url)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502,
+                                detail=f"text proxy failed: {r.status_code}")
+        text = r.text.strip()
+        await browser.close()
+        return {"source": proxy_url, "excerpt": text[:1500]}
         except Exception as e:
             await browser.close()
             raise HTTPException(status_code=502, detail=f"playwright error: {e}")
