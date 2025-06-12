@@ -49,6 +49,7 @@ async def scrape(body: Req):
         # 2) 远程 Browserless 抓正文
         bl_url = f"https://chrome.browserless.io/content?token={BL}"
         res = await client.post(bl_url, json={"url": url})
+        print("BL_STATUS:", res.status_code, res.text[:120])
         text = res.json().get("data", "")
 
         return {
