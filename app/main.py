@@ -3,30 +3,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx, os, urllib.parse
 
-BL = os.getenv("BROWSERLESS_TOKEN")   # 在 Render → Environment 设置
-SERP = os.getenv("SERPAPI_KEY")       # 可选
+# ⬇️ 从 Render → Environment 里读 token/key
+BL   = os.getenv("BROWSERLESS_TOKEN")          # 必填：Browserless API Key
+SERP = os.getenv("SERPAPI_KEY")                # 选填：SerpAPI Key（无则走 Google URL）
 
 app = FastAPI()
 
-# --- 解决 CORS/OPTIONS ---
+# --- 允许任意域跨域；正式可收窄 allow_origins ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # 若需要收敛域名，可改为 ["https://app.lovable.so"]
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
-# --- 请求体：query / prompt 二选一 ---
+# --- 请求体；支持 query 或 prompt 任意字段 ---
 class Req(BaseModel):
-    query: str | None = None
+    query:  str | None = None
     prompt: str | None = None
 
     @property
     def text(self) -> str:
         return self.query or self.prompt or ""
 
-# --- 主路由 ---
+# --- 核心路由 ---
 @app.post("/scrape")
 async def scrape(body: Req):
     search_term = body.text.strip()
@@ -34,7 +35,7 @@ async def scrape(body: Req):
         raise HTTPException(status_code=400, detail="empty input")
 
     async with httpx.AsyncClient(timeout=30) as client:
-        # ① 取首条搜索结果
+        # ① 搜索：优先用 SerpAPI → 回退 Google URL
         if SERP:
             r = await client.get(
                 "https://serpapi.com/search",
@@ -47,22 +48,31 @@ async def scrape(body: Req):
         else:
             url = f"https://www.google.com/search?q={urllib.parse.quote(search_term)}"
 
-        # ② Browserless 抓正文（新域名 & Accept 头）
-        bl_url = f"https://production-sfo.browserless.io/content?token={BL}"
+        # ② Browserless 抽正文（新版 /scrape 端点）
+        bl_url = f"https://production-sfo.browserless.io/scrape?token={BL}"
+        payload = {
+            "url": url,
+            "elements": [
+                { "selector": "body", "type": "text" }   # 抽取 <body> 全文；可改更精确选择器
+            ]
+        }
         res = await client.post(
             bl_url,
-            json={"url": url},
+            json=payload,
             headers={"Accept": "application/json"}
         )
 
-        # 200 但非 JSON：很可能目标站反爬 / 返回整页 HTML
+        # 若 Browserless 返回 HTML 而非 JSON，直接抛 502
         if "application/json" not in res.headers.get("content-type", ""):
-            raise HTTPException(status_code=502,
-                                detail="Browserless returned non-JSON payload")
+            raise HTTPException(status_code=502, detail="Browserless non-JSON payload")
 
-        text = res.json().get("data", "")
+        try:
+            text = res.json()["data"][0]          # /scrape 格式: {"data": ["纯文本"]}
+        except (KeyError, IndexError):
+            raise HTTPException(status_code=502, detail="scrape result empty")
 
+    # ③ 返回给 Lovable / 前端
     return {
         "source": url,
-        "excerpt": text[:1500]      # 控制长度，Lovable ≤ 1 MB
+        "excerpt": text[:1500]                    # 控制长度 <= 1 MB
     }
